@@ -1,2 +1,2 @@
-dodano obsluge bulk out i prosty write
-dodano prosty program userspace do odgrywania pliku midi na pianinie
+dodano mozliwosc otwierania pliku przez wiele procesow
+moze? poprawiono synchronizacje dostepu do danych
