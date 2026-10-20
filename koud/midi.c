@@ -26,9 +26,15 @@ struct midi_device
 	__u16 bulk_in_packet_size;
 	__u8 bulk_in_endpointAddr;
 	struct kref refCount;
-	struct task_struct *urb_test;
 	struct urb *urb;
+	wait_queue_head_t queue;
+	spinlock_t lock;
+	__u8 flag;
+	int packets_arrived;
+	int packets_read;
+	int packets_lost;
 };
+static struct usb_driver midi_driver;
 
 static const struct usb_device_id midi_table[] = {
 	{ USB_INTERFACE_INFO(MIDI_INTERFACE_CLASS, MIDI_INTERFACE_SUBCLASS, MIDI_INTERFACE_PROTOCOL) },
@@ -46,8 +52,115 @@ static void midi_delete(struct kref *refCount)
 	kfree(dev);
 }
 
+static void midi_bulk_in_callback(struct urb *urb)
+{
+	struct midi_device *dev = urb->context;
+	if (urb->status)
+	{
+		printk(KERN_DEBUG "urb finished with status %d\n", urb->status);
+		return;
+	}
+	printk(KERN_DEBUG "Received %d bytes\n", urb->actual_length);
+	spin_lock(&dev->lock);
+	dev->flag = 1;
+	dev->packets_arrived++;
+	spin_unlock(&dev->lock);
+	wake_up_interruptible(&dev->queue);
+	usb_submit_urb(urb, GFP_ATOMIC);
+}
+
+static int midi_open(struct inode *inode, struct file *file)
+{
+	printk(KERN_DEBUG "MIDI open function called\n");
+	struct midi_device *dev;
+	struct usb_interface *interface;
+	int minor;
+	int retval;
+	minor = iminor(inode);
+	interface = usb_find_interface(&midi_driver, minor);
+	if (!interface)
+	{
+		printk(KERN_ERR "MIDI open: can't find device for minor %d\n", minor);
+		retval = -ENODEV;
+		return retval;
+	}
+	dev = usb_get_intfdata(interface);
+	if (!dev)
+	{
+		retval = -ENODEV;
+		return retval;
+	}
+	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr), dev->bulk_in_buffer, dev->bulk_in_packet_size, midi_bulk_in_callback, dev);
+	retval = usb_submit_urb(dev->urb, GFP_KERNEL);
+	if (retval)
+	{
+		printk(KERN_ERR "MIDI open: failed submitting rcvbulk, error %d\n", retval);
+		return retval;
+	}
+	file->private_data = dev;
+	kref_get(&dev->refCount);
+
+	return 0;
+}
+
+static int midi_release(struct inode *inode, struct file *file)
+{
+	printk(KERN_DEBUG "MIDI release function called\n");
+	struct midi_device *dev;
+	dev = file->private_data;
+	usb_kill_urb(dev->urb);
+	kref_put(&dev->refCount, midi_delete);
+
+	return 0;
+}
+
+static ssize_t midi_read(struct file *file, char __user *buf, size_t count, loff_t *off)
+{
+	// printk(KERN_DEBUG "MIDI read function called\n");
+	struct midi_device *dev;
+	dev = file->private_data;
+	ssize_t retval = 0;
+	if (count > dev->bulk_in_packet_size)
+	{
+		count = dev->bulk_in_packet_size;
+	}
+	if (count < 4)
+	{
+		retval = -EINVAL;
+		goto exit;
+	}
+	retval = wait_event_interruptible(dev->queue, dev->flag != 0);
+	if (retval < 0)
+	{
+		goto exit;
+	}
+	spin_lock_irq(&dev->lock);
+	dev->flag = 0;
+	spin_unlock_irq(&dev->lock);
+	if (copy_to_user(buf, dev->bulk_in_buffer, count))
+	{
+		retval = -EFAULT;
+		printk(KERN_ERR "can't send data to user\n");
+		goto exit;
+	}
+	spin_lock_irq(&dev->lock);
+	dev->packets_read++;
+	dev->packets_lost = dev->packets_arrived-dev->packets_read;
+	spin_unlock_irq(&dev->lock);
+	if (dev->packets_lost) printk(KERN_DEBUG "packets lost %d", dev->packets_lost);
+	retval = count;
+
+exit:
+	return retval;
+}
+
 static const struct file_operations midi_fops = {
 	.owner = THIS_MODULE,
+	.read = midi_read,
+	// .write =	midi_write,
+	.open = midi_open,
+	.release = midi_release,
+	.llseek = noop_llseek,
 };
 
 static struct usb_class_driver midi_class = {
@@ -55,43 +168,6 @@ static struct usb_class_driver midi_class = {
 	.fops =	&midi_fops,
 	.minor_base = MIDI_MINOR_BASE,
 };
-
-static void midi_bulk_in_callback(struct urb *urb)
-{
-	struct midi_device *dev = urb->context;
-	char hex_string[129];
-	printk(KERN_DEBUG "Received %d bytes\n", urb->actual_length);
-	printk(KERN_DEBUG "Received bytes\n");
-	memset(hex_string, 0, sizeof(hex_string));
-	for (size_t i = 0; i < urb->actual_length*2; i+=2)
-	{
-		unsigned char d = dev->bulk_in_buffer[i/2] >> 4;
-		unsigned char r = dev->bulk_in_buffer[i/2] & 0x0f;
-		d += '0';
-		r += '0';
-		if (d > '9') d += 7;
-		if (r > '9') r += 7;
-		hex_string[i] = d;
-		hex_string[i+1] = r;
-	}
-	hex_string[urb->actual_length*2] = '\0';
-	printk(KERN_DEBUG "%s\n", hex_string);
-	usb_submit_urb(urb, GFP_ATOMIC);
-}
-
-static int run_test_bulk_in(void *data)
-{
-	struct midi_device *dev = (struct midi_device *)data;
-	int retval;
-	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr), dev->bulk_in_buffer, dev->bulk_in_packet_size, midi_bulk_in_callback, dev);
-	retval = usb_submit_urb(dev->urb, GFP_KERNEL);
-	while (!kthread_should_stop())
-	{
-		ssleep(1);
-	}
-
-	return 0;
-}
 
 static int midi_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
@@ -104,6 +180,8 @@ static int midi_probe(struct usb_interface *interface, const struct usb_device_i
 	if (!dev)
 		return -ENOMEM;
 	kref_init(&dev->refCount);
+	init_waitqueue_head(&dev->queue);
+	spin_lock_init(&dev->lock);
 	dev->udev = usb_get_dev(interface_to_usbdev(interface));
 	dev->interface = usb_get_intf(interface);
 	dev->urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -143,14 +221,6 @@ static int midi_probe(struct usb_interface *interface, const struct usb_device_i
 		usb_set_intfdata(interface, NULL);
 		goto error;
 	}
-	dev->urb_test = kthread_run(run_test_bulk_in, dev, "test_bulk");
-	if (IS_ERR(dev->urb_test))
-	{
-		printk("KERN_ERR Couldn't run urb test task\n");
-		usb_set_intfdata(interface, NULL);
-		retval = -ENODEV;
-		goto error;
-	}
 	
 	return 0;
 
@@ -165,11 +235,6 @@ static void midi_disconnect(struct usb_interface *interface)
 	printk(KERN_DEBUG "MIDI disconnect function called\n");
 	struct midi_device *dev;
 	dev = usb_get_intfdata(interface);
-	if (dev->urb_test)
-	{
-		kthread_stop(dev->urb_test);
-		printk(KERN_DEBUG "Stopped urb test task\n");
-	}
 	usb_kill_urb(dev->urb);
 	usb_deregister_dev(interface, &midi_class);
 	printk(KERN_DEBUG "Device disconnected: %s %s\n", dev->udev->manufacturer, dev->udev->product);

@@ -1,1 +1,5 @@
-to samo jedyne co sie zmienilo to testowanie asynchronicznych urbow i dodanie rejestracji urzadzenia usb_register_dev (teraz jest widoczne jako /dev/midi*)
+dodano operacje io open release i read (w podstawowej wersji)
+wybrano podejscie ciaglego strumienia ktory rozpoczyna sie w open i konczy w release a read dostaje dane z danego momentu
+strumien async urbow jest rozpoczynany w open i kontynuowany w callbacku
+dodano podstawowy read ktory jest juz blokujacy (czeka na dane - jest budzony przez callback) i w uproszczony sposob zajmuje sie podawaniem danych do userspace
+nalezy zmienic podejscie do przechowywania danych ktore maja zostac przeslane do userspace (wystepuje packet loss - trzeba dodac kolejke wielu komunikatow do ktorej read bedzie sie podpinac)
