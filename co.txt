@@ -1,1 +1,1 @@
-dodano ring buffer do kolejkowania eventow midi
+dodano prosty test bulk out

@@ -38,6 +38,9 @@ struct midi_device
 	unsigned char *ring_buffer;
 	unsigned char *read_ptr;
 	unsigned char *write_ptr;
+	__u16 bulk_out_max_size;
+	__u8 bulk_out_endpointAddr;
+	struct task_struct *urb_test;
 };
 static struct usb_driver midi_driver;
 
@@ -172,10 +175,62 @@ exit:
 	return retval;
 }
 
+static void midi_bulk_out_callback(struct urb *urb)
+{
+	if (urb->status)
+	{
+		printk(KERN_DEBUG "urb finished with status %d\n", urb->status);
+		return;
+	}
+}
+
+static int run_test_bulk_out(void *data)
+{
+	printk(KERN_DEBUG "ran test thread\n");
+	struct midi_device *dev = (struct midi_device *)data;
+	int retval;
+	struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
+	size_t count = 4;
+	int event_no = 0;
+	unsigned char event[4] = {0x09,0x90,0x45,0x7f};
+	unsigned char event1[4] = {0x08,0x80,0x45,0x00};
+	unsigned char *buf = usb_alloc_coherent(dev->udev, count, GFP_KERNEL, &urb->transfer_dma);
+	while (!kthread_should_stop())
+	{
+		ssleep(1);
+		if (!event_no)
+			memcpy(buf, event, count);
+		else
+			memcpy(buf, event1, count);
+		event_no = !event_no;
+		usb_fill_bulk_urb(urb, dev->udev, usb_sndbulkpipe(dev->udev, dev->bulk_out_endpointAddr), buf, count, midi_bulk_out_callback, dev);
+		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+		retval = usb_submit_urb(urb, GFP_KERNEL);
+	}
+	usb_kill_urb(urb);
+	usb_free_coherent(urb->dev, urb->transfer_buffer_length, urb->transfer_buffer, urb->transfer_dma);
+	usb_free_urb(urb);
+
+	return 0;
+}
+
+static ssize_t midi_write(struct file *file, const char __user *buf, size_t count, loff_t *off)
+{
+	printk(KERN_DEBUG "MIDI write function called\n");
+	struct midi_device *dev;
+	dev = file->private_data;
+	ssize_t retval = 0;
+	if (count == 0)
+		goto exit;
+
+exit:
+	return retval;
+}
+
 static const struct file_operations midi_fops = {
 	.owner = THIS_MODULE,
 	.read = midi_read,
-	// .write =	midi_write,
+	.write = midi_write,
 	.open = midi_open,
 	.release = midi_release,
 	.llseek = noop_llseek,
@@ -223,6 +278,12 @@ static int midi_probe(struct usb_interface *interface, const struct usb_device_i
 				goto error;
 			}
 		}
+		if (((endpoint->bmAttributes & 0x03) == 0x02) && !(endpoint->bEndpointAddress & 0x80))
+		{
+			endpoints_found++;
+			dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+			dev->bulk_out_max_size = le16_to_cpu(endpoint->wMaxPacketSize);
+		}
 	}
 	if (!endpoints_found)
 	{
@@ -245,6 +306,14 @@ static int midi_probe(struct usb_interface *interface, const struct usb_device_i
 		usb_set_intfdata(interface, NULL);
 		goto error;
 	}
+	dev->urb_test = kthread_run(run_test_bulk_out, dev, "test_bulk");
+	if (IS_ERR(dev->urb_test))
+	{
+		printk("KERN_ERR Couldn't run urb test task\n");
+		usb_set_intfdata(interface, NULL);
+		retval = -ENODEV;
+		goto error;
+	}
 	
 	return 0;
 
@@ -259,6 +328,11 @@ static void midi_disconnect(struct usb_interface *interface)
 	printk(KERN_DEBUG "MIDI disconnect function called\n");
 	struct midi_device *dev;
 	dev = usb_get_intfdata(interface);
+	if (dev->urb_test)
+	{
+		kthread_stop(dev->urb_test);
+		printk(KERN_DEBUG "Stopped urb test task\n");
+	}
 	usb_kill_urb(dev->urb);
 	usb_deregister_dev(interface, &midi_class);
 	printk(KERN_DEBUG "Device disconnected: %s %s\n", dev->udev->manufacturer, dev->udev->product);
