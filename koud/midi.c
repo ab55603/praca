@@ -18,6 +18,9 @@
 	#define MIDI_MINOR_BASE 192
 #endif
 
+#define MIDI_EVENT_SIZE 4
+#define NO_OF_EVENTS 64
+
 struct midi_device 
 {
 	struct usb_device *udev;
@@ -29,10 +32,12 @@ struct midi_device
 	struct urb *urb;
 	wait_queue_head_t queue;
 	spinlock_t lock;
-	__u8 flag;
 	int packets_arrived;
 	int packets_read;
 	int packets_lost;
+	unsigned char *ring_buffer;
+	unsigned char *read_ptr;
+	unsigned char *write_ptr;
 };
 static struct usb_driver midi_driver;
 
@@ -49,6 +54,7 @@ static void midi_delete(struct kref *refCount)
 	usb_put_dev(dev->udev);
 	usb_free_urb(dev->urb);
 	kfree(dev->bulk_in_buffer);
+	kfree(dev->ring_buffer);
 	kfree(dev);
 }
 
@@ -61,9 +67,17 @@ static void midi_bulk_in_callback(struct urb *urb)
 		return;
 	}
 	printk(KERN_DEBUG "Received %d bytes\n", urb->actual_length);
+	int packets = 0;
+	for (size_t i = 0; i < urb->actual_length; i+=MIDI_EVENT_SIZE)
+	{
+		if (dev->bulk_in_buffer[i] == 0) break;
+		packets++;
+		memcpy(dev->write_ptr, dev->bulk_in_buffer+i, MIDI_EVENT_SIZE);
+		dev->write_ptr += MIDI_EVENT_SIZE;
+		dev->write_ptr = dev->ring_buffer+(dev->write_ptr-dev->ring_buffer) % (MIDI_EVENT_SIZE*NO_OF_EVENTS);
+	}
 	spin_lock(&dev->lock);
-	dev->flag = 1;
-	dev->packets_arrived++;
+	dev->packets_arrived += packets;
 	spin_unlock(&dev->lock);
 	wake_up_interruptible(&dev->queue);
 	usb_submit_urb(urb, GFP_ATOMIC);
@@ -90,6 +104,8 @@ static int midi_open(struct inode *inode, struct file *file)
 		retval = -ENODEV;
 		return retval;
 	}
+	dev->write_ptr = dev->ring_buffer;
+	dev->read_ptr = dev->ring_buffer;
 	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr), dev->bulk_in_buffer, dev->bulk_in_packet_size, midi_bulk_in_callback, dev);
 	retval = usb_submit_urb(dev->urb, GFP_KERNEL);
 	if (retval)
@@ -109,6 +125,8 @@ static int midi_release(struct inode *inode, struct file *file)
 	struct midi_device *dev;
 	dev = file->private_data;
 	usb_kill_urb(dev->urb);
+	dev->read_ptr = dev->ring_buffer;
+	dev->write_ptr = dev->ring_buffer;
 	kref_put(&dev->refCount, midi_delete);
 
 	return 0;
@@ -120,34 +138,34 @@ static ssize_t midi_read(struct file *file, char __user *buf, size_t count, loff
 	struct midi_device *dev;
 	dev = file->private_data;
 	ssize_t retval = 0;
-	if (count > dev->bulk_in_packet_size)
-	{
-		count = dev->bulk_in_packet_size;
-	}
-	if (count < 4)
+	if (count < MIDI_EVENT_SIZE)
 	{
 		retval = -EINVAL;
 		goto exit;
 	}
-	retval = wait_event_interruptible(dev->queue, dev->flag != 0);
+	size_t remainder = count % MIDI_EVENT_SIZE;
+	if (remainder != 0)
+		count -= remainder;
+	retval = wait_event_interruptible(dev->queue, dev->read_ptr != dev->write_ptr);
 	if (retval < 0)
-	{
 		goto exit;
-	}
-	spin_lock_irq(&dev->lock);
-	dev->flag = 0;
-	spin_unlock_irq(&dev->lock);
-	if (copy_to_user(buf, dev->bulk_in_buffer, count))
+	size_t offset = dev->write_ptr > dev->read_ptr ? dev->write_ptr-dev->read_ptr : MIDI_EVENT_SIZE*NO_OF_EVENTS-(dev->read_ptr-dev->ring_buffer);
+	if (count > offset)
+		count = offset;
+	int packets = count/MIDI_EVENT_SIZE;
+	if (dev->packets_lost) printk(KERN_DEBUG "packets lost %d", dev->packets_lost);
+	if (copy_to_user(buf, dev->read_ptr, count))
 	{
 		retval = -EFAULT;
 		printk(KERN_ERR "can't send data to user\n");
 		goto exit;
 	}
+	dev->read_ptr += count;
+	dev->read_ptr = dev->ring_buffer+(dev->read_ptr-dev->ring_buffer) % (MIDI_EVENT_SIZE*NO_OF_EVENTS);
 	spin_lock_irq(&dev->lock);
-	dev->packets_read++;
+	dev->packets_read += packets;
 	dev->packets_lost = dev->packets_arrived-dev->packets_read;
 	spin_unlock_irq(&dev->lock);
-	if (dev->packets_lost) printk(KERN_DEBUG "packets lost %d", dev->packets_lost);
 	retval = count;
 
 exit:
@@ -209,6 +227,12 @@ static int midi_probe(struct usb_interface *interface, const struct usb_device_i
 	if (!endpoints_found)
 	{
 		retval = -ENODEV;
+		goto error;
+	}
+	dev->ring_buffer = kmalloc(NO_OF_EVENTS*MIDI_EVENT_SIZE, GFP_KERNEL);
+	if (!dev->ring_buffer)
+	{
+		retval = -ENOMEM;
 		goto error;
 	}
 	printk(KERN_DEBUG "allocated %dB for bulk in transactions at endpoint addr 0x%02x (IN)\n", dev->bulk_in_packet_size, dev->bulk_in_endpointAddr);

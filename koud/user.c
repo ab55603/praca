@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#define COUNT 4
+#define COUNT 64
 
 int main(void)
 {
